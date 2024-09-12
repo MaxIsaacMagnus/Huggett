@@ -1,0 +1,199 @@
+################################
+### Packages ###
+################################
+
+import matplotlib.pyplot as plt
+import numpy as np
+import scipy.stats as st
+from scipy.stats import norm
+from numba import njit, float64, int32
+from numba.experimental import jitclass
+
+
+##########################################################
+### Tauchen Hussey method ###
+##########################################################
+
+def tauchen_hussey(N, mu, rho, sigma, sigma_e):
+
+    # define the state space
+    grid_std = sigma / np.sqrt(1 - rho**2) # std deviation of the stationary distribution
+    grid = np.linspace(-3 * grid_std, 3 * grid_std, N)
+
+    # Gaussian nodes and weights
+    nodes, weights = np.polynomial.hermite.hermgauss(N)
+
+    # compute the transitional probabilities
+    Pi = np.zeros((N, N))        # transition matrix Pi
+
+    for i in range(N):           # rows in Pi
+        for j in range(N):       # columns in Pi
+            mean = rho * grid[i]
+            Pi[i, j] = norm.pdf(grid[j], loc=mean, scale=sigma_e) * weights[j]
+
+        # normalize the rows in the matrix so that they sum to one
+        Pi[i, :] /= np.sum(Pi[i, :])
+
+    # return the grid point in levels, i.e., compute y = exp(s)
+    y = np.exp(grid)
+
+    return y, Pi
+
+
+#############################################################
+### Model and functions ###
+#############################################################
+
+
+class HuggettModel:
+    def __init__(self,
+                 β=0.993362, 
+                 γ=3, 
+                 a_bar=0,
+                 sigma_e=np.sqrt(0.015),
+                 rho=0.95,
+                 tol=1e-6,
+                 tol_d = 1e-8,
+                 tol_v = 1e-3,
+                 max_iterations=1000,
+                 r_initial_guess = 0.01):
+       
+        # Model parameters
+        self.β = β 
+        self.γ = γ
+        self.a_bar = a_bar
+        self.sigma_e = sigma_e 
+        self.rho = rho
+        self.max_iterations = max_iterations
+        self.tol = tol
+        self.tol_d = tol_d
+        self.tol_v = tol_v
+        self.r = r_initial_guess
+
+        # Grids
+        self.a_grid_min= -3       # borrow constraint
+        self.a_grid_max=24        # maximum assets
+        self.a_grid_size=1000
+        self.y_grid_size=3
+
+#       self.y_grid_min=0.1 
+#       self.y_grid_max=1 
+#       self.y_grid = np.linspace(self.y_grid_min, self.y_grid_max, self.y_grid_size)      # These 3 need not be defined (necessarily)
+
+        # Asset grid:
+        self.a_grid = np.linspace(self.a_grid_min, self.a_grid_max, self.a_grid_size)
+       
+        # Income grid and transitional probabilities (using Tauchen Hussey method):
+        self.y_grid, self.Zprob = tauchen_hussey(
+            self.y_grid_size,                     # income states
+            0,                                    # mean 0
+            self.rho,                             
+            self.sigma_e,
+            self.sigma_e                          # same as sigma_e in this case
+        )  
+        
+        self.num_income_states = len(self.y_grid)
+
+    # Utility function
+    def utility(self, c):
+        
+        γ = self.γ
+        if c <= 1e-8:
+            return -np.inf
+        else:
+            return (c**(1 - γ)) / (1 - γ)
+
+    # Bellman operator:
+    def T(self, V):
+        V_new = np.zeros_like(V)
+        policy_function = np.zeros_like(V)
+
+        for i, a in enumerate(self.a_grid):
+            for j, z in enumerate(self.y_grid):
+                max_value = -np.inf             # initial value for optimizing (=large negative number)
+                a_prime_star = 0
+
+                for i_prime, a_prime in enumerate(self.a_grid):   
+                    consumption = a*(1+self.r) + z - a_prime
+                    if consumption <= 0:
+                        break
+
+                    Exp_value_function = np.sum(self.Zprob[j, :] * V[i_prime, :])
+                    value_function = self.utility(consumption) + self.β * Exp_value_function
+
+                    if value_function > max_value:
+                        max_value = value_function
+                        a_prime_star = a_prime
+
+                # Update the Value/policy functions before the next iteration.
+                V_new[i, j] = max_value
+                policy_function[i, j] = a_prime_star
+                
+        return V_new, policy_function
+
+    # Stationary distribution (iteration method):
+    def stationary_distribution(self, policy_function):
+        
+        # Initialize stationary distribution
+        dist = np.ones((len(self.a_grid), self.num_income_states)) / (len(self.a_grid) * self.num_income_states)
+        dist_new = np.zeros_like(dist)
+
+        # Iterate until the stationary distribution converges
+        for _ in range(self.max_iterations):
+            for i in range(len(self.a_grid)):
+                for j in range(self.num_income_states):
+                    a_prime = policy_function[i, j]
+                    i_prime = np.searchsorted(self.a_grid, a_prime)  # Index for next period's asset choice
+
+                    # Transition over income states
+                    for j_prime in range(self.num_income_states):
+                        dist_new[i_prime, j_prime] += dist[i, j] * self.Zprob[j, j_prime]
+
+            # Check for convergence of the distribution
+            if np.max(np.abs(dist_new - dist)) < self.tol_d:
+                break
+            dist = dist_new.copy()
+
+        return dist_new     
+
+    # Compute excess demand for assets:
+    def excess_demand(self, policy_function):
+        
+        # Calculate the stationary distribution
+        stationary_dist = self.stationary_distribution(policy_function)
+    
+        # Compute total savings in the economy
+        aggregate_savings = np.sum(stationary_dist * self.a_grid[:, np.newaxis])
+
+        return aggregate_savings
+
+    # Find equilibrium interest rate:
+    def equ_interest_rate(self):
+        for _ in range(self.max_iterations):
+
+            # solve for value function (again) given current interest rate
+            V = np.zeros((len(self.a_grid), self.num_income_states))
+            V_new, policy_function = self.T(V)
+            
+            aggregate_savings = self.excess_demand(policy_function)
+           
+            # check for convergence (market clearing)
+            if np.abs(aggregate_savings) < self.tol_v:
+                print(f"Equilibrium interest rate found after {iteration + 1} iterations: r = {self.r}") if verbose else None
+                break
+
+            if verbose:
+                print(f"Iteration {iteration + 1}: r = {self.r:.6f}, aggregate savings = {aggregate_savings:.6f}")
+
+            # Adjust interest rate: if aggregate savings > 0, reduce interest rate; otherwise, increase
+            self.r -= 0.01 * aggregate_savings
+
+        return self.r
+
+# Create an instance of the Huggett-model:
+Huggett = HuggettModel()
+
+# Find equilibrium interest rate:
+equ_r = Huggett.equ_interest_rate()
+
+  
