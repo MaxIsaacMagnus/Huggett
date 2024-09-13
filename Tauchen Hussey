@@ -1,0 +1,52 @@
+
+
+
+# Income
+N = 3 # nr of income grids
+rho = 0.95
+sigma_e = np.sqrt(0.015)
+floden_w = 0.5 + rho / 4
+sigmaZ = sigma_e / np.sqrt(1 - rho**2)
+floden_sigma = floden_w * sigma_e + (1 - floden_w) * sigmaZ
+
+# Tauchen-Hussey Function
+def tauchen_hussey(N, mu, rho, sigma_e, floden_sigma):
+    
+    # Define the state space grid centered around mu
+    grid = np.linspace(-2.4*floden_sigma, 2.4*floden_sigma, N) + mu           # use, for example, values within 2.4 std dev. from the mean (3 is usually more fitting though)
+
+    # Gaussian-Hermite nodes and weights
+    nodes, weights = np.polynomial.hermite.hermgauss(N)
+    nodes = nodes * np.sqrt(2) * sigma_e  # scale nodes for N(0, sigma_e^2)
+    weights = weights / np.sqrt(np.pi)    # normalize weights for N(0,1)
+    
+    # Initialize the transition matrix
+    P = np.zeros((N, N))
+
+    for i in range(N):
+        for j in range(N):
+            # Calculate the z_prime value
+            zprime = rho * grid[i] + nodes[j]  # AR(1) process next period
+            
+            # Calculate transition probability using normal PDF
+            P[i, j] = weights[j] * stats.norm.pdf(grid[j], loc=zprime, scale=sigma_e)
+
+        # Normalize the row to ensure the probabilities sum to 1
+        P[i, :] /= np.sum(P[i, :])
+    
+    # Return the grid points in levels (income), i.e., y = exp(s)
+    y = np.exp(grid)
+
+    return y, P
+
+# Run the Tauchen-Hussey approximation
+y, P = tauchen_hussey(N, 0, rho, sigma_e, floden_sigma)
+
+# Output results
+print("Income grid (y):", y)
+print("Transition matrix (P):", P)
+
+inv_P = np.linalg.matrix_power(P, 10000)
+
+
+# and that's it. Next step would be to define asset grid.
