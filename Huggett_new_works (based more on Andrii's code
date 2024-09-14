@@ -1,0 +1,182 @@
+import numpy as np
+from scipy.optimize import bisect
+import scipy.stats as stats
+
+##############################################################
+
+# Model parameters
+T = 2 / 12  # Length of period
+beta = 0.993362  # Discount factor
+gamma = 3   # Relative risk aversion
+a_min = -3  # Borrowing constraint
+a_max = 24  # Maximum assets
+A_bar = 0    
+tol_v = 1e-6  # Tolerance for value function iteration
+tol_d = 1e-8  # Tolerance for distribution iteration
+tol_m = 1e-3  # Tolerance for market clearing
+money = 0  # Money, introduced later in the model
+
+# Income process
+N = 3       # nr of income stated
+rho = 0.95  # income persistence
+sigma_e = np.sqrt(0.015)
+floden_w = 0.5 + rho / 4
+sigmaZ = sigma_e / np.sqrt(1 - rho**2)
+floden_sigma = floden_w * sigma_e + (1 - floden_w) * sigmaZ
+
+# Grids
+grid_income = 3    # Number of income states (same as N)
+grid_asset = 1000  # Number of points on asset grid
+
+###############################################################
+
+# Tauchen-Hussey Function
+def tauchen_hussey(N, mu, rho, sigma_e, floden_sigma):
+    
+    # Define the state space grid centered around mu
+    grid = np.linspace(-2.4*floden_sigma, 2.4*floden_sigma, N) + mu  # use, for example, values within 2.4 std dev. from the mean (3 may be more fitting usually though)
+
+    # Gaussian-Hermite nodes and weights
+    nodes, weights = np.polynomial.hermite.hermgauss(N)
+    nodes = nodes * np.sqrt(2) * sigma_e  # scale nodes for N(0, sigma_e^2)
+    weights = weights / np.sqrt(np.pi)    # normalize weights for N(0,1)
+    
+    # Initialize the transition matrix
+    P = np.zeros((N, N))
+
+    for i in range(N):
+        for j in range(N):
+            # Calculate the z_prime value
+            zprime = rho * grid[i] + nodes[j]  # AR(1) process next period
+            
+            # Calculate transition probability using normal PDF
+            P[i, j] = weights[j] * stats.norm.pdf(grid[j], loc=zprime, scale=sigma_e)
+
+        # Normalize the row to ensure the probabilities sum to 1
+        P[i, :] /= np.sum(P[i, :])
+    
+    # Return the grid points in levels (income), i.e., y = exp(s)
+    y = np.exp(grid)
+
+    return y, P
+
+# Run the Tauchen-Hussey approximation
+y, P = tauchen_hussey(N, 0, rho, sigma_e, floden_sigma)
+
+# Output results
+print("Income grid (y):", y)
+print("Transition matrix (P):", P)
+
+
+####################################################################
+
+
+# Asset grid:
+a_grid = np.exp(np.linspace(np.log(1), np.log(a_max + 1 - a_min), grid_asset)) - 1 + a_min
+
+# or, if one wishes to define the grid without log spaced grid points:
+# a_grid = np.linspace(a_min, a_max, grid_asset)
+
+
+####################################################################
+
+### Solving the model interest rate: ###
+
+
+# Initial interest rate guess
+
+r0 = 0               # initial guess
+r_min = -1           # lowest interest rate is set to -100%
+r_max = 1 / beta - 1 # highest interest rate as in the RA model
+counter = 1          # iteration counter
+
+
+# time.time(), if we want to measure performance
+
+while True:
+    # Solve optimal policies
+    s_j, a_i, a_k = np.meshgrid(y, a_grid, a_grid, indexing='ij')
+    y_grid = s_j
+
+    # Consumption
+    consumption = a_i * (1 + r0) + y_grid - a_k
+
+    # Utility function
+    if gamma == 1:
+        utility = np.log(consumption)  # special case to avoid division by zero
+    else:
+        utility = (consumption**(1 - gamma)) / (1 - gamma)
+
+    # Avoid consumption below zero by assigning large negative utility to such values
+    utility[consumption < 0] = -1e10
+
+
+    
+    # Value function iteration
+    V0 = np.zeros((grid_asset, grid_income))
+  
+    while True:
+        EV = np.tensordot(V0, P, axes=(1, 0))  # Expected value function
+        EV = np.transpose(np.tile(EV, (grid_asset, 1, 1)), (2, 0, 1)) # match the grids so that EV has dimension (3, 1000, 1000)
+
+        bellman = utility + beta * EV
+    
+        V = np.max(bellman, axis=2).T   # maximize along the 2nd axis (that is, a_k)
+        a_policy_grid = np.argmax(bellman, axis=2).T # make sure policy function also has correct dimensions
+
+        # check for convergence
+        if np.max(np.abs(V0 - V)) < tol_v:
+            break
+            
+        V0 = V
+
+
+    # Solving for the stationary distribution
+    # initial guess lambda_0, ensure that all entries sum to 1
+    lambda_0 = np.ones((grid_asset, grid_income)) / (grid_asset * grid_income)
+    
+    while True:
+        lambda_new = np.zeros_like(lambda_0)
+        
+        # update lambda_new
+        for i in range(grid_asset):
+            lambda_new[i, :] = np.sum(lambda_0 * (a_policy_grid == i) @ P, axis=0)
+
+        if np.max(np.abs(lambda_new - lambda_0)) < tol_d:
+            break
+            
+        lambda_0 = lambda_new
+        
+
+    # Market clearing
+    a_plus = a_grid[a_policy_grid]
+    A_demand = np.sum(a_plus * lambda_new)  # make sure the elemants are multiplied here
+
+    # Updating the guess for interest rate (bi-section)
+    if abs(A_demand - A_bar) > tol_m:
+        if A_demand - A_bar > 0:
+            if money == 0:
+                r_max = r0
+                r0 = (r_min + r_max) / 2
+            else:
+                P = money / (A_demand - A_bar)
+                print("Monetary equilibrium is found.")
+                print(f"Money demand: {A_demand - A_bar}")
+                print(f"Price level: {P}")
+                break
+        else:
+            r_min = r0
+            r0 = (r_min + r_max) / 2
+    else:
+        r_annual = ((1 + r0) ** (1 / T)) - 1
+        print("Non-monetary equilibrium is found.")
+        print(f"Equilibrium interest rate: {r0}")
+        print(f"Equilibrium interest rate (annualized): {r_annual}")
+        break
+
+    print(f"ITERATION: {counter}")
+    print(f"Excess asset demand: {A_demand - A_bar}")
+    print(f"New interest rate: {r0}")
+    counter += 1
+
+######################################################################
