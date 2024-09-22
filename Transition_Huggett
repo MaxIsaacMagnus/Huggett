@@ -1,0 +1,336 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from numba import njit
+
+
+
+##### Steady state ######
+
+
+# Parameters
+beta = 0.993362  # Discount factor
+gamma = 1.5  # Relative risk aversion
+a_high = 10  # Maximum on asset grid
+A_s = 0  # Bonds supply
+rho = 0.95  # Income persistence
+sigma2_eps = 0.015  # Income variance
+
+# Grid settings
+grid_income = 2  # Number of income states
+grid_asset = 1000  # Number of points on asset grid
+grid_asset_log = 1  # Binary switch for log asset grid
+tol_v = 1e-6  # Tolerance for value function iteration
+tol_d = 1e-8  # Tolerance for distribution iteration
+tol_mc = 1e-3  # Tolerance for market clearing
+
+# Income states and transition probabilities
+s = np.array([0.1, 1])
+s22 = 0.925
+s12 = 0.5
+P_s = np.array([[1 - s12, s12], [1 - s22, s22]])
+
+
+# Function to solve for the steady state with a given borrowing constraint
+def compute_steady_state(a_low, r_initial, max_iter = 15):
+    # Construct asset grid
+    if grid_asset_log:
+        a_1 = 0
+        a_n = np.log(a_high - a_low + 1)
+        a_grid = np.linspace(a_1, a_n, grid_asset)
+        a_grid = np.exp(a_grid) - 1 + a_low
+    else:
+        a_grid = np.linspace(a_low, a_high, grid_asset)
+
+    # Steady state computation
+    def value_function_iteration():
+        V0 = np.zeros((grid_asset, grid_income))  # Initial guess for value function
+        c_grid = np.zeros((grid_asset, grid_income, grid_asset))
+        a_policy_grid = np.zeros((grid_asset, grid_income), dtype=int)
+
+        for i in range(grid_income):
+            for j in range(grid_asset):
+                for k in range(grid_asset):
+                    c_grid[j, i, k] = a_grid[j] * (1 + r) + s[i] - a_grid[k]
+
+        c_grid = np.maximum(c_grid, 1e-10)
+        
+        u_grid = (c_grid**(1 - gamma)) / (1 - gamma)
+
+        while True:
+            EV = np.einsum('ij,jk->ik', V0, P_s)  # Expected value
+            EV = np.tile(EV.T, (grid_asset, 1, 1))
+
+            V = np.max(u_grid + beta * EV, axis=2)
+            a_policy_grid = np.argmax(u_grid + beta * EV, axis=2)
+
+            if np.max(np.abs(V - V0)) < tol_v:
+                break
+
+            V0 = V
+
+        return V, a_policy_grid
+
+    def distribution_iteration(a_policy_grid):
+        lambda0 = np.ones((grid_asset, grid_income)) / (grid_asset * grid_income)
+        lambda_ = np.zeros_like(lambda0)
+
+        while True:
+            lambda_new = np.zeros_like(lambda_)
+
+            # Iterate over all asset states
+            for i in range(grid_asset):
+                for j in range(grid_income):
+                    policy_mask = (a_policy_grid == i)  # Boolean mask (grid_asset, grid_income)
+
+                    for k in range(grid_income):
+                        lambda_new[i, j] += np.sum(lambda0[:, k] * policy_mask[:, k] * P_s[k, j])
+
+            if np.max(np.abs(lambda_new - lambda0)) < tol_d:
+                break
+
+            lambda0 = lambda_new
+
+        return lambda_new
+
+    def market_clearing(lambda_, a_policy_grid):
+        a_policy = a_grid[a_policy_grid]
+        A_d = np.sum(a_policy * lambda_)
+        return A_d
+
+    # Steady state algorithm
+    r = r_initial  # Initial guess for interest rate
+    r_lower = -0.1  # Lowest possible interest rate
+    r_higher = 1 / beta - 1  # Highest possible interest rate
+    iter = 1
+
+    while iter <= max_iter:
+        V, a_policy_grid = value_function_iteration()
+
+        # Step 3: Solve for the ergodic distribution
+        lambda_ = distribution_iteration(a_policy_grid)
+
+        # Step 4: Check market clearing
+        A_d = market_clearing(lambda_, a_policy_grid)
+
+        excess_demand = A_d - A_s
+        print(f"Iteration {iter}, Excess asset demand: {excess_demand:.6f}, Interest rate: {r*100:.4f}%")
+        
+        # Step 5: Update guess for interest rate
+        if abs(A_d - A_s) > tol_mc:
+            if A_d > A_s:
+                r_higher = r
+                r = 0.5 * (r_lower + r_higher)
+            else:
+                r_lower = r
+                r = 0.5 * (r_lower + r_higher)
+        else:
+            r_ann = (1 + r) ** (1 / T_year) - 1
+            print(f"Equilibrium interest rate: {r*100:.6f}%")
+            break
+
+        print(f"Iteration {iter}, Excess asset demand: {A_d - A_s}")
+       
+        iter += 1
+
+    if iter > max_iter:
+        print(f"Warning: Maximum iterations reached ({max_iter}) without convergence.")
+
+    return r, A_d, V, lambda_
+
+
+# Initial interest rate guess
+r_initial = 0.0
+
+# Compute steady state for a_low_pre and save results
+print(f"\nSteady state with a_low_pre = {a_low_pre}:")
+r_pre, A_d_pre, V_pre, lambda_pre = compute_steady_state(a_low_pre, r_initial, max_iter=15)
+np.savez("steady_pre.npz", r=r_pre, A_d=A_d_pre, V=V_pre, lambda_=lambda_pre)
+
+# Compute steady state for a_low_post and save results
+print(f"\nSteady state with a_low_post = {a_low_post}:")
+r_post, A_d_post, V_post, lambda_post = compute_steady_state(a_low_post, r_initial, max_iter=15)
+np.savez("steady_post.npz", r=r_post, A_d=A_d_post, V=V_post, lambda_=lambda_post)
+
+
+#######################################################################
+
+#### Transition path ####
+
+# Transition path computation
+
+# Parameters (define or adapt based on your actual model)
+T = 100  # Total number of periods
+T_trans = 25  # Transition period
+
+r_sens = 0.003
+tol_mc = 1e-2 / 2
+max_iter = 10  # Maximum number of iterations for the transition path. 
+               # This are by far too few iterations. 
+               # However, no convergence was achieved irregardless of iterations.
+
+a_low_pre = -4  # Borrowing constraint (initial)
+a_low_post = -6  # Borrowing constraint (final)
+grid_asset = 1000  # Number of points on asset grid
+grid_asset_log = True  # Binary switch for logarithmic grid
+
+# Borrowing limit path
+a_low_path = np.full(T, a_low_post)
+a_low_path[:T_trans] = np.linspace(a_low_pre, a_low_post, T_trans)
+
+a_high = np.full(T, 10)  # Maximum assets achievable across all periods
+
+a_1 = 0
+a_n = np.log(a_high - a_low_path + 1)
+
+# Initialize asset grid for each period
+a_grid_path = np.full((grid_asset, T), np.nan)
+
+# Construct the asset grid for each period
+for t in range(T):
+    if grid_asset_log:
+        a_grid_path[:, t] = np.exp(np.linspace(a_1, a_n[t], grid_asset)) - 1 + a_low_path[t]
+    else:
+        # Uniform grid
+        a_grid_path[:, t] = np.linspace(a_low_path[t], a_high_path[t], grid_asset)
+
+
+# Transition solving algorithm
+r_pre = np.load("steady_pre.npz")['r']
+r_post = np.load("steady_post.npz")['r']
+
+# Guess interest rate path
+r_path = np.linspace(r_pre, r_post, T)
+
+# Excess demand path
+A_d_path = np.zeros(T)
+A_d_path[-1] = np.load('steady_post.npz')['A_d']
+
+# Transition grids and values
+V_path = np.zeros((grid_asset, grid_income, T)) # Value function
+
+steady_state_data = np.load("steady_post.npz") # load steady state value function from post
+V_steady_state = steady_state_data['V']  
+V_path[:, :, T-1] = np.maximum(V_steady_state, 0) # Value function at time T
+
+a_policy_grid_path = np.full((grid_asset, grid_income, T), np.nan)
+a_policy_grid_path[:, :, T-1] = np.zeros((grid_asset, grid_income))
+
+lambda_path = np.full((grid_asset, grid_income, T), np.nan)
+
+# Load values from the steady state solution
+lambda_path[:, :, 0] = np.load("steady_pre.npz")['lambda_']
+
+# Iteration loop for solving the transition path
+iter = 1
+
+while iter <= max_iter:        
+    # Solve backward for the policy rules
+    c_grid_t = np.zeros((grid_asset, grid_income, grid_asset))  # Initialize c_grid_t with zeros
+    
+    for t in range(T - 2, -1, -1):         
+        for i in range(grid_income):
+            for j in range(grid_asset):
+                for k in range(grid_asset):
+                    if t < T - 1:
+                        c_grid_t[j, i, k] = a_grid_path[j, t] * (1 + r_path[t + 1]) + s[i] - a_grid_path[k, t + 1]
+                    else:
+                        c_grid_t[j, i, k] = a_grid_path[j, t] * (1 + r_path[t]) + s[i]
+        
+        if gamma == 1:
+            u_grid_t = np.log(np.maximum(c_grid_t, 1e-10))
+        else:
+            u_grid_t = np.where(c_grid_t > 0, (c_grid_t**(1 - gamma)) / (1 - gamma), -1e10)
+        
+        EV_t = np.einsum('ij,jk->ik', V_path[:, :, t + 1], P_s)
+        EV_t = np.tile(EV_t[:, np.newaxis, :], (1, grid_asset, 1))
+
+        # Transpose EV_t to align it with u_grid_t
+        EV_t = np.transpose(EV_t, (0, 2, 1))  # Transpose the last two axes
+
+        # Now the shapes should be compatible for addition
+        V_path[:, :, t] = np.max(u_grid_t + beta * EV_t, axis=2)
+        a_policy_grid_path[:, :, t] = np.argmax(u_grid_t + beta * EV_t, axis=2)
+        
+#        print(f"Continuation value EV_t at t={t}, first few values:\n{EV_t[:5, :5]}")        
+#        print(f"Maximizing over u_grid_t + beta * EV_t, policy choices at t={t}:\n{a_policy_grid_path[:5, :, t]}")    
+#        print(f"Policy function at t={t}, first few values:\n{a_policy_grid_path[:5, :, t]}")
+
+    # Solve for the distribution (going forward in time)
+    for t in range(1, T):
+        for i in range(grid_asset):
+            for j in range(grid_income):
+                lambda_path[i, j, t] = 0
+                for k in range(grid_income):
+                    lambda_path[i, j, t] += np.sum(lambda_path[:, k, t - 1] * (a_policy_grid_path[:, k, t - 1] == i) * P_s[k, j])
+        
+######################################################################        
+# Print distribution and transition matrix for debugging:
+#        print(f"Transition matrix P_s at period t={t}:\n{P_s}")
+#        print(f"Distribution at t={t}, first few values:\n{lambda_path[:5, :, t]}")
+   
+#    print(f"Policy at t=0, first few values:\n{a_policy_grid_path[:5, :, 0]}")
+#    print(f"Distribution at t=1, first few values:\n{lambda_path[:5, :, 1]}")
+#    print(f"Distribution at t={T-1}, first few values:\n{lambda_path[:5, :, T-1]}")
+
+######################################################################
+    
+    # Compute excess demand for each period    
+    A_d_path = np.array([np.sum(a_grid_path[:, t] * np.sum(lambda_path[:, :, t], axis=1)) for t in range(T)])
+
+######################################################################    
+# Print excess demand for debugging
+    print(f"Excess demand for first few periods:\n{A_d_path[:5]}")
+    
+######################################################################
+    # Check and update the interest rate path based on excess demand
+    if np.max(np.abs(A_d_path - A_s)) < tol_mc:
+        break
+        
+    r_path[:] += r_sens * (A_d_path[:] - A_s)  # Adjust interest rate path for all periods
+
+    iter += 1
+
+
+# Save transition results
+np.savez("transition_path.npz", r_path=r_path, V_path=V_path, lambda_path=lambda_path)
+
+#### Plots #### (preliminary)
+
+
+### r ###
+plt.figure(figsize=(10, 6))
+
+# Plot the interest rate transition
+plt.plot(range(T), r_path, label='Interest Rate Transition', color='b')
+
+# Add labels and title
+plt.xlabel('Time Period')
+plt.ylabel('Interest Rate')
+plt.title('Transition of Interest Rate over Time')
+plt.legend()
+plt.show()
+
+### assets ###
+plt.figure(figsize=(10, 6))
+
+# Plot the interest rate transition
+plt.plot(range(T), a_low_path, color='b')
+
+# Add labels and title
+plt.xlabel('Time Period')
+plt.title('Borrowing limit over time')
+plt.legend()
+plt.show()
+
+### market clearing ###
+
+plt.figure(figsize=(10, 6))
+
+# Plot the interest rate transition
+plt.plot(range(T), A_d_path, color='b')
+
+# Add labels and title
+plt.xlabel('Time Period')
+plt.title('Borrowing limit over time')
+plt.legend()
+plt.show()
