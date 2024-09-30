@@ -1,0 +1,281 @@
+import numpy as np
+from numba import njit
+from scipy.stats import norm
+from scipy.interpolate import RegularGridInterpolator
+from scipy.spatial import cKDTree
+import time
+
+
+
+class Environment:
+    def __init__(self, beta, gamma, alpha, delta, borrow, rho, sigma_e, N, grid_asset, grid_income, grid_cash, tol_v, tol_d, tol_m, tol_r, a_max):
+        self.beta = beta
+        self.gamma = gamma
+        self.alpha = alpha
+        self.delta = delta
+        self.borrow = borrow
+        self.rho = rho
+        self.sigma_e = sigma_e
+        self.N = N
+        self.grid_asset = grid_asset
+        self.grid_income = grid_income
+        self.grid_cash = grid_cash
+        self.a_max = a_max
+
+        # Tolerances for convergence
+        self.tol_v = tol_v  # Tolerance for value function iteration convergence
+        self.tol_d = tol_d  # Tolerance for stationary distribution convergence
+        self.tol_m = tol_m  # Tolerance for market clearing
+        self.tol_r = tol_r  # Tolerance for interest rate convergence
+
+        # Asset grid
+        self.a = np.linspace(borrow, a_max, grid_asset)
+
+        # Parameters for income process
+        self.floden_w = 0.5 + self.rho / 4
+        self.sigmaZ = self.sigma_e / np.sqrt(1 - self.rho ** 2)
+        self.floden_sigma = self.floden_w * self.sigma_e + (1 - self.floden_w) * self.sigmaZ
+
+
+
+
+class Market:
+    def __init__(self, environment):
+        self.env = environment
+        # Initial guess for capital: K = 2.9208221499
+        self.K = ((1 / self.env.beta - 1 + self.env.delta) / self.env.alpha) ** (1 / (self.env.alpha - 1))
+
+    def factor_prices(self, K):
+        r = self.env.alpha * K ** (self.env.alpha - 1) - self.env.delta
+        w = (1 - self.env.alpha) * ((r + self.env.delta) / self.env.alpha) ** (self.env.alpha / (self.env.alpha - 1))
+        return r, w
+
+
+
+
+
+class Agent:
+    def __init__(self, environment):
+        self.env = environment
+
+    def tauchen_hussey(self, mu, rho, sigma, sigma_e):
+        grid_std = sigma / np.sqrt(1 - rho ** 2)
+        grid = np.linspace(-3 * grid_std, 3 * grid_std, self.env.N)
+
+        # Hermite Gaussian quadrature nodes and weights
+        nodes, weights = np.polynomial.hermite.hermgauss(self.env.N)
+
+        # Transition matrix
+        P = np.zeros((self.env.N, self.env.N))
+
+        for i in range(self.env.N):
+            for j in range(self.env.N):
+                mean = rho * grid[i]
+                P[i, j] = norm.pdf(grid[j], loc=mean, scale=sigma_e) * weights[j]
+
+            row_sum = np.sum(P[i, :])
+            if row_sum > 0:
+                P[i, :] /= row_sum  # Normalize rows to sum to 1
+
+
+        y = np.exp(grid)
+
+        # Find the stationary distribution by computing the eigenvector
+        D_s, V_s = np.linalg.eig(P.T)
+        stationary_dist = np.real(V_s[:, np.isclose(D_s, 1)])
+        stationary_dist /= np.sum(stationary_dist)
+
+        # Normalize income so that expected income equals 1
+        expected_income = np.dot(stationary_dist.T, y)
+        y = y / expected_income  # Normalize y by its expected value
+        return y, P
+
+    def value_function_iteration(self, r, w, P, y, a):
+        V0 = np.zeros((self.env.grid_asset, self.env.grid_income))  # Should match asset grid size
+        V_new = np.zeros((self.env.grid_asset, self.env.grid_income))  # Asset and income grid
+        
+        cash_grid = np.linspace(self.env.borrow, self.env.a_max, self.env.grid_asset)  # Use asset grid size for cash grid
+    
+        # Create meshes for income, cash, and asset grids
+        y_mesh, a_k, x_i = np.meshgrid(y, a, cash_grid, indexing='ij')  # Make sure asset and cash grids are correctly placed
+    
+        # Cash on hand and consumption
+        c_i = x_i - a_k
+        c_i = np.maximum(c_i, 1e-10)  # Ensure consumption is non-negative
+    
+        # Utility function
+        utility = (c_i ** (1 - self.env.gamma)) / (1 - self.env.gamma)
+        utility[c_i < 0] = -1e10  # Penalize negative consumption
+    
+        # Pre-define the interpolation grid and setup RegularGridInterpolator
+        interpolation_grid = (cash_grid, np.arange(self.env.grid_income))
+        V_interpolator = RegularGridInterpolator(interpolation_grid, V0)
+        
+        # Track number of iterations
+        vfi_iterations = 0
+        start_time = time.time()
+
+        max_iterations = 1000
+        while True:
+            if vfi_iterations >= max_iterations:
+                print("Warning: Value function iteration did not converge in the maximum number of iterations.")
+                break
+                    
+            vfi_iterations += 1
+            
+            for i in range(self.env.grid_income):
+                points = np.array([a, np.full_like(a, i)]).T
+                V_new[:, i] = V_interpolator(points)
+    
+            EV = np.dot(V_new, P.T)
+            EV = np.tile(EV[:, :, np.newaxis], (1, 1, self.env.grid_asset))
+            EV = np.transpose(EV, (1, 2, 0))
+    
+            # Bellman equation
+            V = np.max(utility + self.env.beta * EV, axis=2).T  # Max over asset choices
+            a_policy_grid = np.argmax(utility + self.env.beta * EV, axis=2)  # Find optimal asset choice
+    
+            a_policy_grid = np.clip(a_policy_grid, 0, len(a)-1)  # Clip policy function
+    
+            if np.linalg.norm(V0 - V, ord=np.inf) < self.env.tol_v:
+                break
+    
+            V0 = V
+
+        end_time = time.time()
+        print(f"Value Function Iteration completed in {vfi_iterations} iterations and took {end_time - start_time:.2f} seconds.")
+        return V, a_policy_grid
+    
+           
+
+
+def find_stationary_distribution(env, a_policy_grid, P):
+    tol_d = 1e-6
+    
+    # Initialize the distribution over asset and income states
+    stationary_distribution = np.zeros((env.grid_asset, env.grid_income))
+
+    # Assume uniform distribution initially
+    stationary_distribution[0, :] = 1.0 / env.grid_income
+
+    diff = np.inf
+    max_iterations = 1000
+    iteration = 0
+
+    while diff > tol_d and iteration < max_iterations:
+        iteration += 1
+        new_distribution = np.zeros_like(stationary_distribution)
+
+        # Loop over all current income states and asset positions
+        for i in range(env.grid_income):  # current income state
+            for j in range(env.grid_asset):  # current asset state
+                
+                # Find next asset level 
+                next_asset = np.clip(a_policy_grid[i, j], 0, env.grid_asset - 1)  
+                
+                for k in range(env.grid_income):  # next income state
+                    new_distribution[int(next_asset), k] += stationary_distribution[j, i] * P[i, k]
+
+        # Calculate the change in distribution
+        diff = np.linalg.norm(new_distribution - stationary_distribution, ord=np.inf)
+        
+        # Update the distribution
+        stationary_distribution = new_distribution
+
+    if iteration == max_iterations:
+        print("Warning: Stationary distribution did not converge within the maximum number of iterations.")
+    
+    print(f"Stationary distribution converged in {iteration} iterations.")
+    return stationary_distribution
+
+
+
+
+
+def solve_model(env, market, agent):
+    """
+    Solve the Aiyagari model by iterating on the interest rate until the capital market clears.
+    
+    env: The environment object
+    market: The market object (handles factor prices and aggregate capital)
+    agent: The agent object (handles VFI and stationary distribution)
+    
+    Returns:
+    - r: Steady-state interest rate
+    - K: Steady-state capital stock
+    - stationary_distribution: Stationary distribution over asset-income pairs
+    """
+
+    # Initial guesses for the interest rate and tolerance for convergence
+    r_low, r_high = 0, 1/0.96 - 1
+    tol_r = env.tol_r 
+    max_iterations = 1000
+    iteration = 0
+    
+    while iteration < max_iterations:
+        iteration += 1
+        r = (r_low + r_high) / 2
+        
+        w = market.factor_prices(market.K)[1]                                 # wages
+
+        y, P = agent.tauchen_hussey(0, env.rho, env.sigmaZ, env.sigma_e)      # Tauchen Hussey
+        V, a_policy_grid = agent.value_function_iteration(r, w, P, y, env.a)   # Value function, policy function
+        stationary_distribution = find_stationary_distribution(env, a_policy_grid, P)   # Stationary distribution
+
+        # Get Aggregate capital (K) as the weighted sum of assets
+        aggregate_capital = np.sum(stationary_distribution * np.repeat(env.a[:, np.newaxis], env.grid_income, axis=1))
+        market.K = aggregate_capital
+        
+        # Excess capital demand
+        excess_capital = aggregate_capital - market.K
+        
+        # Check if capital market clears
+        if np.abs(excess_capital) < tol_r:
+            print(f"Market clearing achieved in {iteration} iterations.")
+            return r, aggregate_capital, stationary_distribution
+            
+        
+        # Adjust the interest rate
+        if excess_capital > 0:
+            r_high = r  # Too much capital supply, lower interest rate
+        else:
+            r_low = r  # Not enough capital supply, increase interest rate
+
+    print("Warning: Market did not clear in the maximum number of iterations.")
+    print(f"Excess capital at exit: {excess_capital}")
+    return r, aggregate_capital, stationary_distribution
+
+
+
+
+
+# Run the model 
+env = Environment(
+    beta=0.96,           # Discount factor
+    gamma=1.5,           # Risk aversion
+    alpha=0.3,          # Capital share in production
+    delta=0.1,          # Depreciation rate
+    borrow=-1,          # Borrowing constraint
+    rho=0.94,             # Income shock persistence
+    sigma_e=np.sqrt(0.04), # Income shock volatility
+    N=5,                 # Number of income states
+    grid_asset=1500,      # Asset grid points
+    grid_cash=1501,       # Cash-on-hand grid points
+    grid_income=5,       # Income grid points
+    tol_v=1e-6,          # Tolerance for value function convergence
+    tol_d=1e-6,          # Tolerance for stationary distribution convergence
+    tol_m=1e-5,          # Tolerance for market clearing
+    tol_r=1e-4,          # Tolerance for interest rate convergence
+    a_max=150            # Maximum asset level
+)
+
+market = Market(env)
+agent = Agent(env)
+
+# Run the model to solve for steady state
+r_ss, K_ss, stationary_dist = solve_model(env, market, agent)
+
+# Print results
+print(f"Steady-state interest rate: {r_ss}")
+print(f"Steady-state capital: {K_ss}")
+
